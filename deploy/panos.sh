@@ -1,5 +1,7 @@
 #!/usr/bin/env sh
 
+# Updated 7/28/2023
+#
 # Script to deploy certificates to Palo Alto Networks PANOS via API
 # Note PANOS API KEY and IP address needs to be set prior to running.
 # The following variables exported from environment will be used.
@@ -9,8 +11,63 @@
 #
 # REQURED:
 #     export PANOS_HOST=""    #Can be a single host, or multiple hosts delimited by a comma or space.
-#     export PANOS_USER=""    #User *MUST* have Commit and Import Permissions in XML API for Admin Role
-#     export PANOS_PASS=""
+#     export PANOS_USER=""    #User *MUST* have Commit and Import Permissions in XML API for Admin Role.
+#     export PANOS_PASS=""    #Used to generate an API key.  You can disable saving the password by setting 'PANOS_SAVE_PASS=false'
+#
+#
+# OPTIONAL:
+#     export PANOS_SAVE_UNIQUE_LOGINS=true     # Saves username and password by host. Useful if you are deploying
+#                                              # the same cert to multiple hosts and want to use a unique username
+#                                              # and password for each host.
+#                                              #
+#                                              # If this setting is to false, the script will use the same username/password
+#                                              # for every host (Default: false).
+#                                              # (Default: false)
+#                                              #
+#                                              # Note: If you have set 'PANOS_SAVE_PASSWORD=false', the script will
+#                                              # ONLY save the username and NOT the password.
+#
+#
+#     export PANOS_REMOVE_ORPHAN_HOSTS=true    # Delete saved username, password and keys from hosts not currently listed in 'PANOS_HOST'.
+#                                              # If you have enabled 'PANOS_SAVE_UNIQUE_LOGINS=true', do not enable this until you have
+#                                              # FINISHED deploying certs to all hosts indivually, AND you have added back ALL the hosts to 'PANOS_HOST'.
+#                                              #  -- Not Completed -
+#
+#
+#     export PANOS_DELETE_ORPHAN_KEYS=false   # This key only applies to multi-host deployments.  By default, the script saves
+#                                             # a unique key for each deployment host.  When a host is deleted,
+#                                             # the script deletes the associated host API key to keep the conf file nice and tidy.
+#                                             #
+#                                             # By setting this key to 'false', the script will *NOT* delete the associated API ke
+#                                             # when a host is removed from 'PANOS_HOST'.  This can be useful in the following siutations:
+#                                             #
+#                                             #     1) You are temporarily removing a host but plan to add it back later.
+#                                             #     2) You wish to deploy using **UNIQUE** passwords for each host.  Please note that
+#                                             #        even when using unique passwords, the 'PANOS_USER' must be the same across all the hosts.
+#                                             #        To generate unique passwords for each host, you must ALSO set the following ENV variable:
+#                                             #             'PANOS_SAVE_PASSWORD=false'
+#                                             #        You must then deploy to each host INDIVIDUALLY (One at a time) by adding a SINGLE host
+#                                             #        to the 'PANOS_HOST=' ENV variable, then deploying. This will  ensure the host specific.
+#                                             #        API key is saved.  Once you have finished deploying to all the hosts indivdually, add all the
+#                                             #        hosts to the 'PANOS_HOST' variable, delimiting each host with a  "," or " " (comma or space).
+#                                             #        You can then set 'PANOS_DELETE_ORPHAN_KEYS=true' if you wish to keep the conf file nice and tidy, but
+#                                             #        you MUST set 'PANOS_SAVE_PASSWORD=false'!
+#                                             #
+#                                             #        Important: You must ALSO delete any PANOS_PASS ENV variables, otherwise the script may try to regenerate
+#                                             #        an API key if it things the password has changed.
+#                                             #
+#                                             #        Please note that if your password changes or the API key expires, your deployment will fail, and
+#                                             #        you will need to regenerate the API key by  the process for the affected host(s).
+#
+#
+#     export PANOS_SAVE_PASSWORD=false        # Enables saving PANOS_PASS to config file for the security conscious types.
+#                                             # PANOS_PASS is used to generate an API key, which IS saved to the config file.
+#                                             # If you disable saving the password, the script can **NOT** regenerate the API
+#                                             # key if the key expires, or if the key must be regenerated.  This will cause the
+#                                             # Deployment to FAIL.   Use with caution!   (Default is 'true')
+#
+#
+#
 #
 # EXAMPLE:
 #     # You can use any of the following methods to export a host
@@ -19,8 +76,11 @@
 #     export PANOS_HOST="fw1.mydomain.com fw2.mydomain.com 10.8.8.22"              # Also vaild
 #     export PANOS_HOST=",,   fw1.mydomain.com   , 172.15.2.3,fw3.mydomain.com,"   # This works as well! (But WHY?)
 #
+#     # You can
 #     export PANOS_USER="svc_acmeuser"
 #     export PANOS_PASS="a089s98qasdjfadfasdsdf"
+#
+#
 #
 # The script will automatically generate a new API key if
 # no key is found, or if a saved key has expired or is invalid.
@@ -28,6 +88,7 @@
 # This function is to parse the XML response from the firewall
 parse_response() {
   type=$2
+  _host_reachable=true    # Any response means the host is reachable
   if [ "$type" = 'keygen' ]; then
     status=$(echo "$1" | sed 's/^.*\(['\'']\)\([a-z]*\)'\''.*/\2/g')
     if [ "$status" = "success" ]; then
@@ -37,12 +98,15 @@ parse_response() {
       message="PAN-OS Key could not be set."
     fi
   else
+    _debug "Raw Firewall result: $1"
     status=$(echo "$1" | tr -d '\n' | sed 's/^.*"\([a-z]*\)".*/\1/g')
     message=$(echo "$1" | tr -d '\n' | sed 's/.*\(<result>\|<msg>\|<line>\)\([^<]*\).*/\2/g')
     _debug "Firewall message:  $message"
     if [ "$type" = 'keytest' ] && [ "$status" != "success" ]; then
       _debug "****  API Key has EXPIRED or is INVALID ****"
       unset _panos_key
+    elif [ "$status" != "success" ]; then
+      _upload_failure=true
     fi
   fi
   return 0
@@ -119,9 +183,9 @@ deployer() {
     content="type=commit&action=partial&key=$_panos_key&cmd=$cmd"
   fi
 
+  # Send request to firewall and parse response
   response=$(_post "$content" "$panos_url" "" "POST")
   parse_response "$response" "$type"
-  # Saving response to variables
   response_status=$status
   _debug response_status "$response_status"
   if [ "$response_status" = "success" ]; then
@@ -130,7 +194,6 @@ deployer() {
   else
     _err "Deploy of type $type failed. Try deploying with --debug to troubleshoot."
     _err "$message"
-    return 1
   fi
 }
 
@@ -139,14 +202,62 @@ panos_deploy() {
   _cdomain=$(echo "$1" | sed 's/*/WILDCARD_/g') #Wildcard Safe Filename
   _ckey="$2"
   _cfullchain="$5"
-  _regen_keys=false #Flag to regenerate keys if PANOS_USER or PANOS_PASS changes.
-  _old_host=""      #Empty string placeholder for old hosts
 
-  # VALID FILE CHECK
+  ## Other variables
+  _old_host=""                # Placeholder for previously deployed firwalls
+  _regen_keys=false           # Flag to regenerate keys if PANOS_USER or PANOS_PASS changes.
+  _save_password=true         # Saves password in conf file. Default is 'true' (User modifiable using ENV variable PANOS_SAVE_PASSWORD)
+  _delete_orphan_keys=true    # Deletes orphan API keys when a host is removed in a multi-host deployment. (User modifiable using ENV variable PANOS_DELETE_ORPHAN_KEYS)
+
+
+  ## VALID FILE CHECK
   if [ ! -f "$_ckey" ] || [ ! -f "$_cfullchain" ]; then
     _err "Unable to find a valid key and/or cert.  If this is an ECDSA/ECC cert, use the --ecc flag when deploying."
     return 1
   fi
+
+
+  ## OPTIONAL - PANOS_DELETE_ORPHAN_KEYS - Optinal switch to delete keys when a host is removed from PANOS_HOST list.  Applies only to multi-host deployments.
+  if [ "$PANOS_DELETE_ORPHAN_KEYS" ]; then
+    _debug "Detected ENV variable PANOS_DELETE_ORPHAN_KEYS"
+    if [ "$PANOS_DELETE_ORPHAN_KEYS" != true ] && [ "$PANOS_DELETE_ORPHAN_KEYS" != false ]; then
+      _error "Variable PANOS_DELETE_ORPHAN_KEYS must be set to 'true' or 'false'"
+    else
+      _savedeployconf PANOS_DELETE_ORPHAN_KEYS "$PANOS_DELETE_ORPHAN_KEYS"
+      _delete_orphan_keys="$PANOS_DELETE_ORPHAN_KEYS"
+    fi
+  else
+    _getdeployconf PANOS_DELETE_ORPHAN_KEYS
+    if [ "$PANOS_DELETE_ORPHAN_KEYS" ]; then
+      _delete_orphan_keys="$PANOS_DELETE_ORPHAN_KEYS"
+    fi
+  fi
+  _debug "PANOS_DELETE_ORPHAN_KEYS set to $_delete_orphan_keys"
+
+
+  ## PANOS_SAVE_PASSWORD - Switch to save password to conf file
+  if [ "$PANOS_SAVE_PASSWORD" ]; then
+    _debug "Detected ENV variable PANOS_SAVE_PASSWORD"
+    if [ "$PANOS_SAVE_PASSWORD" != true ] && [ "$PANOS_SAVE_PASSWORD" != false ]; then
+      _error "Variable PANOS_SAVE_PASSWORD must be set to 'true' or 'false'"
+    else
+      _savedeployconf PANOS_SAVE_PASSWORD "$PANOS_SAVE_PASSWORD"
+      _save_password=$PANOS_SAVE_PASSWORD
+    fi
+  else
+    _getdeployconf PANOS_SAVE_PASSWORD
+    if [ "$PANOS_SAVE_PASSWORD" ]; then
+      _save_password=$PANOS_SAVE_PASSWORD
+    fi
+  fi
+  _debug "PANOS_SAVE_PASSWORD set to $_save_password"
+
+  ## DELETE SAVED PASSWORDS from conf if _save_password set to false
+  if [ "$_save_password" = false ]; then
+    _debug "Deleting saved password (PANOS_PASS) from conf (NOT the API Key)"
+    _cleardomainconf "SAVED_PANOS_PASS"
+  fi
+
 
   ## PANOS_HOST - Can be a single host, or a comma delimited string of multiple hosts
   if [ "$PANOS_HOST" ]; then
@@ -170,6 +281,7 @@ panos_deploy() {
     _old_host="$PANOS_HOST" #Save the old hosts variable for later cleanup
   fi
 
+
   ## PANOS USER
   if [ "$PANOS_USER" ]; then
     _debug "Detected ENV variable PANOS_USER. Looking for changes..."
@@ -191,6 +303,7 @@ panos_deploy() {
     _getdeployconf PANOS_USER
   fi
 
+
   ## PANOS_PASS
   if [ "$PANOS_PASS" ]; then
     _debug "Detected ENV variable PANOS_PASS. Looking for changes..."
@@ -200,11 +313,12 @@ panos_deploy() {
     #Attempt to load saved variable
     _getdeployconf PANOS_PASS
     if [ -z "$PANOS_PASS" ] || { [ "$PANOS_PASS" ] && [ "$PANOS_ENV_PASS" != "$PANOS_PASS" ]; }; then
-      #if [ "$PANOS_ENV_PASS" != "$PANOS_PASS" ]; then
-      _debug "PANOS_PASS has changed.  Saving changes to disk."
-      _savedeployconf PANOS_PASS "$PANOS_ENV_PASS" 1
-      _regen_keys=true #Regenerate keys if the password changes
+      if [ "$_save_password" = true ]; then
+        _debug "PANOS_PASS has changed.  Saving changes to disk."
+        _savedeployconf PANOS_PASS "$PANOS_ENV_PASS" 1
+      fi
       PANOS_PASS="$PANOS_ENV_PASS"
+      _debug "PANOS_PASS is $PANOS_PASS"
     else
       _debug "PANOS_PASS is unchanged."
     fi
@@ -224,7 +338,7 @@ panos_deploy() {
   elif [ -z "$_panos_user" ]; then
     _err "No user found. If this is your first time deploying, please set PANOS_USER in ENV variables. You can delete it after you have successfully deployed the certs."
     return 1
-  elif [ -z "$_panos_pass" ]; then
+  elif [ -z "$_panos_pass" ] && [ "$_save_password" = true ]; then
     _err "No password found. If this is your first time deploying, please set PANOS_PASS in ENV variables. You can delete it after you have successfully deployed the certs."
     return 1
   else
@@ -239,20 +353,26 @@ panos_deploy() {
       _debug "*****  PROCESSING HOST: $_panos_host  *****"
       _debug "**************************************************"
 
-      # Use MD5 to generate unique API key name suffixes, retreive API key from file and store as variable _panos_key
+      # Placeholder variable to check if the host is reachable.  Will switch to "true" if any response is received.
+      _host_reachable=false
+      _upload_failure=false
+
+      # Use MD5 to generate unique suffix ID for each host
       md5suffix=$(echo "$_panos_host" | md5sum | awk '{print $1}')
       host_key_name="PANOS_KEY_$md5suffix"
+
+      # Load md5 API key from saved conf
       _getdeployconf "$host_key_name"
       eval "_panos_key=\${$host_key_name}"
 
       # Test API key.  If the key is invalid, the variable _panos_key will be unset.
       if [ "$_panos_key" ]; then
-        _debug "**** Testing API KEY ****"
+        _debug "**** Testing Saved API KEY ****"
         deployer keytest
       fi
 
-      # Generate a new API key if no valid API key is found, or if _regen_keys is true
-      if [ -z "$_panos_key" ] || [ "$_regen_keys" = true ]; then
+      # Generate a new API key if required, or if _regen_keys is true.  Requires password to be present.
+      if [ "$_panos_pass" ] && { [ -z "$_panos_key" ] || [ "$_regen_keys" = true ]; }; then
         _debug "**** Generating new PANOS Host API KEY ****"
         deployer keygen
         _savedeployconf "$host_key_name" "$_panos_key" 1
@@ -261,14 +381,33 @@ panos_deploy() {
       # Confirm that a valid key was generated
       if [ -z "$_panos_key" ]; then
         _err ""
-        _err "Unable to generate an API key.  The user and pass may be invalid or not authorized to generate a new key. "
-        _err "Please check the PANOS_USER and PANOS_PASS credentials and try again."
-        _err "If your credentials are valid, you may need to use the --insecure flag."
-        return 1
+        _err "Unable to generate an API key for host: $_panos_host."
+        _err ""
+        if [ "$_host_reachable" = false ]; then
+          _err "The firewall is unreachable.  Please double check the host name and ensure the firewall is online"
+        else
+          _err "The username and /or password may be missing, invalid or not authorized to generate a new key."
+          _err "Please check the PANOS_USER and PANOS_PASS credentials are present in ENV and try again."
+          _err "If your credentials are valid, you may need to use the --insecure flag."
+        fi
       else
-        deployer cert
-        deployer key
-        deployer commit
+        ## PANOS has a bug where a key can be uploaded with a mismatched cert.  This is an issue if the user switches between RSA and ECDSA keys.
+        if [ "$_isEcc" ]; then
+          deployer key
+          deployer cert
+        else
+          deployer cert
+          deployer key
+        fi
+
+        ## Commit changes only if there are no failures
+        if [ "$_upload_failure" = false ]; then
+          deployer commit
+        else
+          _err ""
+          _err "FAILURE:  Unable to commit changes to firewall due to issues uploading cert or key.  Please manually roll back any changes."
+        fi
+
       fi
     done
     _info "**** Finished deploying certs to host(s) ****"
@@ -276,7 +415,7 @@ panos_deploy() {
     #########################################################################
     ### Generate a list of deleted hosts and delete orphan keys from conf ###
     #########################################################################
-    if [ "$_old_host" ] && [ "$_old_host" != "$PANOS_HOST" ]; then
+    if [ "$_delete_orphan_keys" = true ] && [ "$_old_host" ] && [ "$_old_host" != "$PANOS_HOST" ]; then
       _debug "**************************************************"
       _debug "***** Removing orphan keys for deleted hosts *****"
       _debug "**************************************************"
